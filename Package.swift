@@ -30,7 +30,8 @@ let package = Package(
         .target( 
             name: "ErrorHandle",
             dependencies: [
-                .product(name: "Logging", package: "swift-log")
+                .product(name: "Logging", package: "swift-log"),
+                .product(name: "AnyCodable", package: "AnyCodable")
             ]
         ),
         .target(
@@ -71,8 +72,7 @@ let package = Package(
                 .target(name: "DataConvertable"),
                 .product(name: "OrderedCollections", package: "swift-collections"),
                 .product(name: "Logging", package: "swift-log"),
-                .product(name: "Puppy", package: "Puppy"),
-                .product(name: "AnyCodable", package: "AnyCodable")
+                .product(name: "Puppy", package: "Puppy")
             ]
         ),
         .testTarget(

@@ -68,6 +68,7 @@ public extension Crypto {
         public enum Errcase: String, ErrList {
             case aesEncryptFailed = "AES 加密失败"
             case aesDecryptFailed = "AES 解密失败"
+            case chunkTagConvertFailed = "加解密 块标签转换失败"
         }
         
         public typealias Key = SymmetricKey
@@ -307,7 +308,10 @@ extension Crypto.Symm {
     @inlinable
     static func aesEncrypt<T>(_ data: T, key: Key) -> Res<Data, Errcase> where T: DecodingThrowableDataConvertable {
         // print("正在进行加密: \(try data.data().count), key: \(key.data().base64String()))")
-        precondition(key.bitCount == Crypto.symmetricKeySize.bitCount, "密钥长度不正确，应当为 \(Crypto.symmetricKeySize.bitCount) 位，却得到 \(key.bitCount) 位")
+        
+        guard key.bitCount == Crypto.symmetricKeySize.bitCount else {
+            return .failure(.aesEncryptFailed, "密钥长度不正确，应当为 \(Crypto.symmetricKeySize.bitCount) 位，却得到 \(key.bitCount) 位", category: .external())
+        }
         
         return Result(throws: .aesEncryptFailed, "AES 加密未能成功封印明文数据", category: .inherit) {
             try AES.GCM.seal(data.dataRes.get(), using: key, nonce: .init())
@@ -323,7 +327,10 @@ extension Crypto.Symm {
     @inlinable
     static func aesDecrypt<D>(_ cipher: Data, key: Key) -> Res<D, Errcase> where D: EncodingThrowableDataConvertable {
         // print("正在进行解密: \(cipher.count), key: \(key.data().base64String()))")
-        precondition(key.bitCount == Crypto.symmetricKeySize.bitCount, "密钥长度不正确，应当为 \(Crypto.symmetricKeySize.bitCount) 位，却得到 \(key.bitCount) 位")
+        
+        guard key.bitCount == Crypto.symmetricKeySize.bitCount else {
+            return .failure(.aesDecryptFailed, "密钥长度不正确，应当为 \(Crypto.symmetricKeySize.bitCount) 位，却得到 \(key.bitCount) 位", category: .external())
+        }
         
         return Result(throws: .aesDecryptFailed, category: .inherit) {
             let sealedBox = try AES.GCM.SealedBox(combined: cipher)
@@ -344,12 +351,13 @@ extension Crypto.Symm.Stream {
     
     @inlinable
     static func chunkEncrypt<T>(_ data: T, key: Crypto.Symm.Key, chunkTag: Int) -> Res<Data, Crypto.Symm.Errcase> where T: DecodingThrowableDataConvertable {
-        precondition(key.bitCount == Crypto.symmetricKeySize.bitCount, "密钥长度不正确，应当为 \(Crypto.symmetricKeySize.bitCount) 位，却得到 \(key.bitCount) 位")
-        
-        let chunkTagData = chunkTagToData(chunkTag)
+        guard key.bitCount == Crypto.symmetricKeySize.bitCount else {
+            return .failure(.aesEncryptFailed, "密钥长度不正确，应当为 \(Crypto.symmetricKeySize.bitCount) 位，却得到 \(key.bitCount) 位", category: .external())
+        }
         
         return Result(throws: .aesEncryptFailed, category: .inherit) {
-            try AES.GCM.seal(
+            let chunkTagData = try chunkTagToData(chunkTag)
+            return try AES.GCM.seal(
                 data.dataRes.get(),
                 using: key,
                 nonce: .init(),
@@ -367,13 +375,17 @@ extension Crypto.Symm.Stream {
     
     @inlinable
     static func chunkDecrypt<T>(_ cipher: Data, key: Crypto.Symm.Key, chunkTag: Int) -> Res<T, Crypto.Symm.Errcase> where T: EncodingThrowableDataConvertable {
-        precondition(key.bitCount == Crypto.symmetricKeySize.bitCount, "密钥长度不正确，应当为 \(Crypto.symmetricKeySize.bitCount) 位，却得到 \(key.bitCount) 位")
-        precondition(cipher.count >= cipherExtraLength, "密文过短，格式不正确，无法解密，至少超过 \(cipherExtraLength)，却得到 \(cipher.count) 字节")
+        guard key.bitCount == Crypto.symmetricKeySize.bitCount else {
+            return .failure(.aesDecryptFailed, "密钥长度不正确，应当为 \(Crypto.symmetricKeySize.bitCount) 位，却得到 \(key.bitCount) 位", category: .external())
+        }
         
-        /// authentication tag.
-        let chunkTagData = chunkTagToData(chunkTag)
+        guard cipher.count >= cipherExtraLength else {
+            return .failure(.aesDecryptFailed, "密文过短，格式不正确，无法解密，至少超过 \(cipherExtraLength)，却得到 \(cipher.count) 字节", category: .external())
+        }
         
         return Result(throws: .aesDecryptFailed, category: .inherit) {
+            /// authentication tag.
+            let chunkTagData = try chunkTagToData(chunkTag)
             let sealedBox = try AES.GCM.SealedBox(combined: cipher)
             return try AES.GCM.open(sealedBox, using: key, authenticating: chunkTagData)
         }.flatMap { plain in
@@ -382,8 +394,10 @@ extension Crypto.Symm.Stream {
     }
     
     @inlinable
-    static func chunkTagToData(_ chunkTag: Int, length: Int = 12) -> Data {
-        precondition(length >= 8, "Nonce 的长度必须至少为 8 bytes 以存储块标记，得到的长度为: \(length)")
+    static func chunkTagToData(_ chunkTag: Int, length: Int = 12) throws(Crypto.Symm.Errcase.ErrType) -> Data {
+        guard length >= 8 else {
+            throw Crypto.Symm.Errcase.chunkTagConvertFailed.d("Nonce 的长度必须至少为 8 bytes 以存储块标记，得到的长度为: \(length)", category: .external())
+        }
         
         var bytes = [UInt8](repeating: 0, count: length)
         withUnsafeBytes(of: chunkTag.bigEndian) { ptr in
