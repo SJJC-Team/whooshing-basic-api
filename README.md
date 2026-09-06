@@ -11,6 +11,7 @@
 - **ErrorHandle (统一错误处理框架)**：
   - 提供 `Err` 和 `ErrList` 协议体系。
   - 支持**错误链（Error Chains）**机制，能自动捕获抛出错误所在的文件、函数、行数，以及挂载附加元数据。
+  - 每个错误必须声明 `ErrCategory`（`.external` / `.internal` / `.inherit`），区分应向外界暴露的输入错误与需要隐藏的内部错误，`.external` 还可携带修复建议与自定义 `userdata`（如 HTTP 状态码）。
 - **DataConvertable (数据类型转换)**：
   - 提供安全的 `SafeDataConvertable`（如 `Int`, `Data`, `Array<Safe>`）和受检的 `ThrowableDataConvertable`（如 `String`, `Dictionary`）协议。
   - 将原生类型与 `Data` 或 `ByteBuffer` 间进行无缝、安全的快速互转。
@@ -28,7 +29,7 @@
 在你的 Package.swift 加入：
 
 ``` swift
-.package(url: "https://github.com/whooshing-workshop/whooshing.toolbox-basic.git", from: "1.6.4")
+.package(url: "https://github.com/whooshing-workshop/whooshing.toolbox-basic.git", from: "1.6.3")
 ```
 
 根据需要导入不同的目标产品：
@@ -79,21 +80,35 @@ let saltyHash = try Crypto.saltyHash("Secret String", salt: &salt).get()
 ``` swift
 import ErrorHandle
 
-// 定义并抛出包含底层错误的包装错误
-func someAction() throws(BscError<MyErrcase>) {
+// 声明一个错误列表，枚举值即为该错误的 summary
+enum MyErrcase: String, ErrList {
+    case openFileFailed = "打开文件失败"
+    case getFileFailed = "获取文件失败"
+}
+
+// 定义并抛出包含底层错误的包装错误（错误类型为 MyErrcase.ErrType，默认即 BasicError<MyErrcase>）
+func someAction() throws(MyErrcase.ErrType) {
     do {
         // ...
     } catch {
         // 自动捕获发生时的 file, line, function
-        // 并通过 .subErr 将底层错误链入
-        throw MyErrcase.openFileFailed.subErr(error)
+        // 并通过 .subErr 将底层错误链入；category 决定该错误如何向外界展示：
+        //   .external(suggestions:userdata:)  由外部输入引起，可携带修复建议与附加数据（如 HTTP 状态码）
+        //   .internal                         内部错误，向外界隐藏细节
+        //   .inherit                          沿用底层错误的类别
+        throw MyErrcase.openFileFailed.subErr(error, category: .inherit)
     }
 }
 
 // 快速抛出带描述信息的错误，并附加额外元数据给日志
 throw MyErrcase.getFileFailed
-    .d("目标并非是一个文件")
+    .d("目标并非是一个文件", category: .external(suggestions: ["请检查路径是否指向文件"]))
     .metadata(["path": .string("/root")])
+
+// 使用 required(...) 把任意抛错的调用收束为指定的错误
+let data = try required(throws: MyErrcase.getFileFailed, "读取失败", category: .internal) {
+    try Data(contentsOf: url)
+}
 ```
 
 #### 3. DataConvertable 数据转换
@@ -127,23 +142,26 @@ let base64 = strData.base64String
 ``` swift
 import NIOAdvanced
 
-// 保持强类型 Error，不再退化为普通的 Swift.Error
-func performAsync() -> EventLoopResult<String, MyErrcase> {
+// EventLoopRes<Value, MyErrcase> 即 EventLoopResult<Value, MyErrcase.ErrType>
+func performAsync() -> EventLoopRes<String, MyErrcase> {
     let future: EventLoopFuture<String> = ...
     
     // 将无严格类型错误的 Future 转化为保留严格类型的 EventLoopResult
-    return future.flatMapErrThrowing { error throws(MyErrcase) in
-        // 在转换层级，你可以通过 .subErr(error) 将原生泛型错误挂载为 Error Chains
-        throw MyErrcase.networkFailed.subErr(error)
-    }
+    // 原生错误会通过 .subErr 被挂载为 Error Chains
+    return future.withError(MyErrcase.networkFailed, "请求远端失败", category: .internal)
 }
 
 // 使用方式类似于原生 Future，但强绑定了具体的错误类型
 performAsync().map { value in
     return value + " success"
-}.flatMapErr { err -> EventLoopResult<String, MyErrcase> in
-    // 在这里错误类型必定是明确的 MyErrcase，不会被擦除
-    return ...
+}.flatMapErrorThrowing { err throws(MyErrcase.ErrType) in
+    // 在这里错误类型必定是明确的 MyErrcase.ErrType，不会被擦除
+    throw err
+}
+
+// 也可以在 async/await 与 EventLoop 之间桥接：
+let result: EventLoopRes<Data, MyErrcase> = eventLoop.bridge { () throws(MyErrcase.ErrType) in
+    try await loadData()
 }
 ```
 
@@ -151,20 +169,44 @@ performAsync().map { value in
 
 ##### 使用 `LoggingFactory` 集中管理日志
 
-通过 `LoggingFactory` 将多个日志规则及后端（如终端输出、Puppy 文件轮转日志）组织为策略数组，并通过全局元数据初始化。支持多工厂实例组合和热插拔。
+通过 `LoggingFactory` 将多个日志分流策略（`LoggerStrategy`，控制台输出或 Puppy 文件轮转日志）组织为策略数组，并通过全局元数据初始化。支持多工厂实例组合与追加。
 
 ``` swift
 import LoggingAdvanced
 
-// 创建一套日志初始化策略，决定不同 Label 的 logger 输出到哪些后端
-let strategy = LoggerStrategy(label: "NetworkSystem", targets: [consoleTarget, fileTarget])
+// 控制台策略：记录所有 trace 及以上等级的日志
+let console = LoggerStrategy(label: "console", level: .trace)
 
-let factory = LoggingFactory(strategies: [strategy], metadataProvider: myGlobalProvider)
-// 也可以组合其他的 factory
-let finalFactory = factory.combine(factories: [anotherFactory])
+// 文件轮转策略：label 以 "network" 开头的 logger 写入 ~/logs/network_logs/network.log
+// 文件过大时自动轮转并备份旧日志，目录不存在会自动创建
+let networkFile = try LoggerStrategy(
+    label: "network",
+    level: .info,
+    config: .file(
+        logPrefix: "network",
+        directory: URL.homeDirectoryForCurrentUser.appendingPathComponent("logs/network_logs"),
+        name: "network.log"
+    )
+)
 
-// 启动生效全局日志拦截体系
+// 也可以用闭包自定义分流规则
+let errorFile = try LoggerStrategy(
+    label: "error",
+    level: .error,
+    config: .file(match: { _ in true }, directory: errorLogDir, name: "error.log")
+)
+
+let factory = LoggingFactory(strategies: [console, networkFile], metadataProvider: myGlobalProvider)
+// 也可以追加策略，或组合其他的 factory
+let finalFactory = factory
+    .append(strategies: [errorFile])
+    .combine(factories: [anotherFactory])
+
+// 启动生效全局日志拦截体系（LoggingSystem.bootstrap）
 finalFactory.bootstrap()
+
+// 从既有 logger 派生子 logger：label 追加 ".sub"，并附带额外元数据
+let logger = Logger(label: "network").derive(subId: "http", metadata: ["module": "api"])
 ```
 
 ##### 使用链式日志记录 (Logger Chaining)
